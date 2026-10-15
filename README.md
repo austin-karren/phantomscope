@@ -170,7 +170,8 @@ pillarboxed — while the same game at native resolution outside gamescope was
 fine.
 
 Phantomscope passes `--force-windows-fullscreen` so there is no tiny window to
-read. If a game already saved a bad value, that has to be corrected once in
+read, which fixes CONTROL Resonant. If a game already saved a bad value, that
+still has to be corrected once in
 the game's own video settings (or its config file) with the game closed —
 nothing outside the game can fix a resolution it has already written down.
 
