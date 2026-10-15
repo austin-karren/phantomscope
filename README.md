@@ -187,18 +187,16 @@ a missing feature.
 
 ### Steam and Wayland
 
-Steam needs `-pipewire` or desktop capture silently falls back to black
-frames, logging `WARNING: Desktop capture unavailable`. To make it stick:
+You do **not** need to add `-pipewire` to your normal Steam launcher.
+Phantomscope passes it to the Steam it starts inside gamescope, and there
+Steam captures gamescope's own PipeWire node directly — `streaming_log.txt`
+shows `CDesktopCapturePipeWire: setting stream node path: gamescope` — with no
+KDE screen-share portal involved and no prompt.
 
-```
-cp /usr/share/applications/steam.desktop ~/.local/share/applications/
-sed -i 's|^Exec=/usr/bin/steam |Exec=/usr/bin/steam -pipewire |' \
-    ~/.local/share/applications/steam.desktop
-```
-
-Working capture logs `CDesktopCapturePipeWire: Opening DRM render node`. The
-first capture raises a KDE portal prompt asking which screen to share; choose
-the phantom display, and the grant persists.
+Adding `-pipewire` to desktop Steam makes it request KDE's *Share screen with
+Steam* portal a few seconds after every start, for capture Phantomscope never
+uses. If you see that dialog, that is why. Plain desktop streaming still works
+without it, through Steam's OpenGL capture fallback.
 
 ## Troubleshooting
 
