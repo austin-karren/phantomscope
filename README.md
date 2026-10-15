@@ -36,6 +36,12 @@ Two things turned out to matter, in this order:
 Point 1 is what fixes the stream. Point 2 is ergonomics — which is why `lite`
 mode, with no phantom display at all, is a legitimate install.
 
+Before:
+<img width="3840" height="2160" alt="screenshot (1)" src="https://github.com/user-attachments/assets/b98d47b9-3fd0-4264-a18b-79f7192922e7" />
+
+After:
+<img width="3840" height="2160" alt="screenshot" src="https://github.com/user-attachments/assets/cb13e47d-fe5f-43bb-8ce1-5daf445ab277" />
+
 ## Requirements
 
 - **KDE Plasma 6 on Wayland.** Uses `kscreen-doctor` and `kdotool`; there is
