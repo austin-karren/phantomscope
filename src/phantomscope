@@ -241,6 +241,11 @@ class Switcher(QThread):
         # Borderless on the phantom so the window is exactly the internal size;
         # fullscreen on the real panel, where letterboxing is unavoidable.
         cmd += ["-b"] if self.use_phantom else ["-f"]
+        # Some games read their window size before gamescope has sized it,
+        # persist that (CONTROL Resonant saved 128x128) and then render a
+        # degenerate square forever after. Forcing windows to the nested
+        # display size means there is never a tiny window to read.
+        cmd += ["--force-windows-fullscreen"]
         cmd += ["-e", "--"] + DESKTOP_STEAM + ["-bigpicture"]
         try:
             subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
