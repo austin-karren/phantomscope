@@ -154,6 +154,24 @@ centred-on-active-screen and the phantom tends to win, so a game launched
 locally can open on a screen you cannot see. This is the main reason the
 display is manual: raise it for a session, drop it after.
 
+**Windowed-mode games can save a bogus resolution.** A game set to *windowed*
+rather than fullscreen reads its window geometry at startup and persists it.
+Launched into gamescope it can read that before gamescope has sized the
+window, save something degenerate, and render it forever after. CONTROL
+Resonant saved `128x128` into its `renderer.ini`, rendered a 128px square
+upscaled to the display height, and the stream arrived blurry and
+pillarboxed — while the same game at native resolution outside gamescope was
+fine.
+
+Phantomscope passes `--force-windows-fullscreen` so there is no tiny window to
+read. If a game already saved a bad value, that has to be corrected once in
+the game's own video settings (or its config file) with the game closed —
+nothing outside the game can fix a resolution it has already written down.
+
+Symptom to recognise: `SynchronizeClientState(): setting capture size NxN`
+with a square or otherwise wrong N in `~/.local/share/Steam/logs/streaming_log.txt`,
+changing the moment the game takes focus.
+
 **There is no automatic mode, deliberately.** An earlier version watched
 Steam's `streaming_log.txt` and raised the display when a client connected. It
 thrashed — every connect/disconnect cycle raised and dropped the output, and
