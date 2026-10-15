@@ -75,6 +75,9 @@ use. `HDMI-A-2`, a second DisplayPort, anything idle.
 
 ## Use
 
+<img width="675" height="675" alt="image" src="https://github.com/user-attachments/assets/0b07d29c-570e-4109-8b37-81509ae5f173" />
+
+
 Launch **Phantomscope**.
 
 - **Start phantom** brings the fake output up. The fixed resolutions are
