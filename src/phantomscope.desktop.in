@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Phantomscope
+Comment=Manage the phantom display and launch Steam inside gamescope at a chosen resolution
+Exec=@BIN@/phantomscope
+Icon=virtual-desktops
+Terminal=false
+Categories=Utility;

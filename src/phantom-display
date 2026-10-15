@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# Raise or drop the phantom display: a fake EDID forced onto an unused
+# connector, so a real output of that size exists without touching the panel
+# you are actually looking at.
+set -euo pipefail
+
+CONFIG=${PHANTOMSCOPE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/phantomscope/config}
+# shellcheck disable=SC1090
+[ -r "$CONFIG" ] && . "$CONFIG"
+
+CONNECTOR=${PHANTOM_CONNECTOR:-${CONNECTOR:-}}
+MODE=${PHANTOM_MODE:-${PHANTOM_DISPLAY_MODE:-3840x2160@60}}
+POSITION=${PHANTOM_POSITION:-}
+HELPER=${PHANTOM_HELPER:-/usr/local/sbin/phantom-display-helper}
+
+die() { echo "phantom-display: $*" >&2; exit 1; }
+[ -n "$CONNECTOR" ] || die "no connector configured (is Phantomscope installed in full mode?)"
+
+strip() { sed -e 's/\x1b\[[0-9;]*m//g'; }
+present() { kscreen-doctor -o 2>/dev/null | strip | grep -q "^Output: [0-9]* $CONNECTOR "; }
+
+# The output holding priority 1 right now -- restored afterwards, because KWin
+# makes a freshly hotplugged output primary on its own, which drags Plasma's
+# panels onto a screen you cannot see.
+current_primary() {
+    kscreen-doctor -o 2>/dev/null | strip | awk -v conn="$CONNECTOR" '
+        /^Output: /  { name = $3 }
+        /priority 1/ { if (name != conn) { print name; exit } }'
+}
+
+# Place it to the right of everything currently on screen.
+default_position() {
+    kscreen-doctor -o 2>/dev/null | strip | awk -v conn="$CONNECTOR" '
+        /^Output: / { name = $3 }
+        /Geometry:/ {
+            if (name == conn) next
+            split($2, p, ",");  split($3, s, "x")
+            right = p[1] + s[1]; if (right > max) max = right
+        }
+        END { print max + 0 "," 0 }'
+}
+
+privileged() {
+    [ -x "$HELPER" ] || die "$HELPER is not installed"
+    if sudo -n "$HELPER" "$1" "$CONNECTOR" 2>/dev/null; then
+        return 0
+    fi
+    local askpass=${SUDO_ASKPASS:-/usr/bin/ksshaskpass}
+    if [ -x "$askpass" ] && [ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]; then
+        SUDO_ASKPASS=$askpass sudo -A "$HELPER" "$1" "$CONNECTOR"
+    else
+        sudo "$HELPER" "$1" "$CONNECTOR"
+    fi
+}
+
+case ${1:-status} in
+on)
+    present && die "$CONNECTOR is already up"
+    main=$(current_primary)
+    privileged on
+    for _ in $(seq 20); do present && break; sleep 0.25; done
+    present || die "kernel accepted the EDID but KWin never saw $CONNECTOR"
+    [ -n "$POSITION" ] || POSITION=$(default_position)
+    # Scale must be pinned to 1 or KDE's DPI heuristic shrinks the logical
+    # size and nothing renders at the real resolution.
+    kscreen-doctor "output.$CONNECTOR.enable" \
+                   "output.$CONNECTOR.mode.$MODE" \
+                   "output.$CONNECTOR.scale.1" \
+                   "output.$CONNECTOR.position.$POSITION"
+    # Separate invocation on purpose: a priority set in the same atomic call
+    # as the enable is silently ignored.
+    if [ -n "$main" ]; then
+        sleep 0.5
+        kscreen-doctor "output.$main.priority.1" >/dev/null 2>&1 || true
+    fi
+    echo "phantom $CONNECTOR up: $MODE at $POSITION"
+    ;;
+off)
+    main=$(current_primary)
+    present && kscreen-doctor "output.$CONNECTOR.disable" || true
+    privileged off
+    [ -n "$main" ] && kscreen-doctor "output.$main.priority.1" >/dev/null 2>&1 || true
+    echo "phantom $CONNECTOR removed"
+    ;;
+is-up)
+    present
+    ;;
+status)
+    shopt -s nullglob
+    for s in /sys/class/drm/*-"$CONNECTOR"/status; do
+        echo "kernel: $CONNECTOR $(cat "$s")"; break
+    done
+    kscreen-doctor -o 2>/dev/null | strip | grep -A3 "^Output: [0-9]* $CONNECTOR " \
+        || echo "kscreen: not present"
+    ;;
+*)
+    die "usage: phantom-display [on|off|status|is-up]"
+    ;;
+esac

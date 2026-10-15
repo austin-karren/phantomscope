@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Privileged half of Phantomscope: forces a fake EDID onto an unused display
+# connector so a real output of that size exists for capture.
+#
+# Reached through a NOPASSWD sudoers rule, so it takes no caller-supplied
+# paths and only accepts a connector the kernel already knows about.
+set -euo pipefail
+
+action=${1:-}
+conn=${2:-}
+edid=/usr/local/share/phantomscope/edid.bin
+
+[ -n "$conn" ] || { echo "usage: phantom-display-helper on|off <connector>" >&2; exit 2; }
+
+# Only connectors this machine actually has, so the argument cannot escape
+# into an arbitrary path.
+case $conn in
+    *[!A-Za-z0-9-]*) echo "refusing malformed connector: $conn" >&2; exit 2 ;;
+esac
+shopt -s nullglob
+sysfs=(/sys/class/drm/*-"$conn")
+[ ${#sysfs[@]} -gt 0 ] || { echo "no such connector: $conn" >&2; exit 2; }
+
+# The same connector appears under several debugfs roots (pci address,
+# primary minor, render minor). Prefer the plain numeric minor.
+dir=
+for d in /sys/kernel/debug/dri/*/"$conn"; do
+    [ -e "$d/edid_override" ] || continue
+    [ -n "$dir" ] || dir=$d
+    m=${d#/sys/kernel/debug/dri/}; m=${m%%/*}
+    case $m in *[!0-9]*) ;; *) dir=$d; break ;; esac
+done
+[ -n "$dir" ] || { echo "no debugfs entry for $conn (is debugfs mounted?)" >&2; exit 1; }
+
+case $action in
+    on)  [ -r "$edid" ] || { echo "missing EDID at $edid" >&2; exit 1; }
+         cat "$edid" > "$dir/edid_override"
+         echo on > "$dir/force" ;;
+    # debugfs 'force' only takes on/off/digital and cannot restore
+    # auto-detection; the sysfs 'status' file accepts 'detect', which clears
+    # the force flag so the port behaves normally again if ever used for real.
+    off) printf reset > "$dir/edid_override"
+         for s in "${sysfs[@]}"; do echo detect > "$s/status"; done ;;
+    *)   echo "usage: phantom-display-helper on|off <connector>" >&2; exit 2 ;;
+esac
+echo 1 > "$dir/trigger_hotplug"

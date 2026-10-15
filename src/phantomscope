@@ -1,0 +1,508 @@
+#!/usr/bin/env python3
+"""Phantomscope: manage the phantom display, and launch Steam inside gamescope.
+
+The phantom presets place gamescope's window at exactly its own internal size
+on the phantom output, so output == internal, 1:1 -- nothing in the chain
+rescales, which is what makes the stream come out at the right aspect ratio.
+"native" runs on the real desktop instead, as it is.
+
+Everything here is manual: raise the phantom yourself before picking a
+resolution for it. Only the stop button tears things down, and it stops
+everything -- gamescope, Steam and the phantom display.
+"""
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QIcon
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
+from PySide6.QtWidgets import (QApplication, QHBoxLayout, QLabel, QMessageBox,
+                               QPushButton, QSizePolicy, QVBoxLayout, QWidget)
+
+# label, width, height, note -- all of these run on the phantom display.
+PRESETS = [
+    ("1920 × 1080", 1920, 1080, "1080p  ·  16:9"),
+    ("2560 × 1440", 2560, 1440, "2K  ·  16:9"),
+    ("3840 × 2160", 3840, 2160, "4K  ·  16:9"),
+    ("2560 × 1080", 2560, 1080, "mobile  ·  21:9"),
+]
+DESKTOP_STEAM = [shutil.which("steam") or "/usr/bin/steam", "-pipewire"]
+
+
+def _config():
+    """Written by install.sh; decides full vs lite and which connector."""
+    path = Path(os.environ.get("PHANTOMSCOPE_CONFIG") or
+                Path(os.environ.get("XDG_CONFIG_HOME",
+                                    Path.home() / ".config")) /
+                "phantomscope" / "config")
+    cfg = {}
+    try:
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                cfg[k.strip()] = v.strip().strip('"\'')
+    except OSError:
+        pass
+    return cfg
+
+
+CONFIG = _config()
+MODE = CONFIG.get("MODE", "full")
+PHANTOM_OUTPUT = CONFIG.get("CONNECTOR", "")
+# Installed beside this script, or anywhere on PATH.
+PHANTOM = (shutil.which("phantom-display")
+           or str(Path(__file__).resolve().parent / "phantom-display"))
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+GAMESCOPE_PAT = r"^gamescope .*-- /usr/bin/steam"
+INSTANCE_KEY = f"phantomscope-{os.getuid()}"
+
+
+def run(*args, timeout=20):
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def steam_running():
+    r = run("pgrep", "-x", "steam")
+    return bool(r and r.returncode == 0)
+
+
+def gamescope_running():
+    r = run("pgrep", "-f", GAMESCOPE_PAT)
+    return bool(r and r.returncode == 0)
+
+
+def phantom_up():
+    if MODE == "lite" or not PHANTOM_OUTPUT:
+        return False
+    r = run(PHANTOM, "is-up", timeout=10)
+    return bool(r and r.returncode == 0)
+
+
+def outputs():
+    r = run("kscreen-doctor", "-o", timeout=10)
+    if not r or r.returncode != 0:
+        return {}
+    out = ANSI.sub("", r.stdout)
+    found = {}
+    for block in re.finditer(r"^Output: \d+ (\S+) .*?(?=^Output:|\Z)", out, re.S | re.M):
+        name, text = block.group(1), block.group(0)
+        geo = re.search(r"Geometry:\s*(-?\d+),(-?\d+)\s+(\d+)x(\d+)", text)
+        mode = re.search(r"\d+:(\d+)x(\d+)@([\d.]+)\*", text)
+        found[name] = {
+            "pos": (int(geo.group(1)), int(geo.group(2))) if geo else None,
+            "size": (int(geo.group(3)), int(geo.group(4))) if geo else None,
+            "mode": (int(mode.group(1)), int(mode.group(2)), float(mode.group(3)))
+                    if mode else None,
+            "primary": "priority 1" in text,
+        }
+    return found
+
+
+def aspect(w, h):
+    r = w / h
+    for ratio, name in ((16 / 9, "16:9"), (21 / 9, "21:9"), (32 / 9, "32:9"),
+                        (16 / 10, "16:10"), (4 / 3, "4:3")):
+        if abs(r - ratio) < 0.09:
+            return name
+    return f"{r:.2f}:1"
+
+
+def native_mode():
+    for info in outputs().values():
+        if info["primary"] and info["mode"]:
+            return info["mode"]
+    return None
+
+
+class PhantomWorker(QThread):
+    """Toggling takes a hotplug plus a KWin settle, so keep it off the UI thread."""
+    done = Signal(bool, str)
+
+    def __init__(self, action):
+        super().__init__()
+        self.action = action
+
+    def run(self):
+        r = run(PHANTOM, self.action, timeout=45)
+        ok = bool(r and r.returncode == 0)
+        msg = (r.stderr or r.stdout or "").strip() if r else "command failed"
+        self.done.emit(ok, msg)
+
+
+class StopWorker(QThread):
+    """Stop everything: gamescope, then Steam, then the phantom display."""
+    progress = Signal(str)
+    done = Signal(str)
+
+    def run(self):
+        self.progress.emit("Stopping gamescope…")
+        run("pkill", "-TERM", "-f", GAMESCOPE_PAT)
+        for _ in range(20):
+            if not gamescope_running():
+                break
+            self.msleep(500)
+        if steam_running():
+            self.progress.emit("Closing Steam…")
+            run("/usr/bin/steam", "-shutdown", timeout=30)
+            for _ in range(30):
+                if not steam_running():
+                    break
+                self.msleep(1000)
+            # -shutdown is unreliable here; fall back to signals.
+            if steam_running():
+                run("pkill", "-TERM", "-x", "steam")
+                for _ in range(15):
+                    if not steam_running():
+                        break
+                    self.msleep(1000)
+                run("pkill", "-KILL", "-x", "steam")
+                run("pkill", "-KILL", "-x", "steamwebhelper")
+        dropped = False
+        if phantom_up():
+            self.progress.emit("Dropping phantom display…")
+            run(PHANTOM, "off", timeout=45)
+            dropped = not phantom_up()
+        self.done.emit("Stopped gamescope and Steam"
+                       + (", phantom display down." if dropped else "."))
+
+
+class Switcher(QThread):
+    """Steam shutdown can take ~45s, so it must not block the UI."""
+    progress = Signal(str)
+    done = Signal(bool, str)
+
+    def __init__(self, width, height, refresh=None, use_phantom=False):
+        super().__init__()
+        self.width, self.height = width, height
+        self.refresh, self.use_phantom = refresh, use_phantom
+
+    def place_on_phantom(self, pos):
+        """gamescope is launched borderless at exactly the preset size, so
+        moving it to the phantom's origin covers it 1:1 with no scaling.
+        This runs seconds after launch, while gamescope is still empty --
+        moving a window that already has Steam rendering in it is not safe."""
+        x, y = pos
+        for _ in range(30):
+            # Anchored on purpose: a bare "gamescope" also matches this
+            # launcher's own class (steam-gamescope), which is found instantly
+            # and gets moved instead of the window we actually want.
+            r = run("kdotool", "search", "--class", "^gamescope$", timeout=10)
+            ids = [w for w in (r.stdout.split() if r and r.stdout else []) if w]
+            if ids:
+                for wid in ids:
+                    run("kdotool", "windowmove", wid, str(x), str(y), timeout=10)
+                self.msleep(4000)
+                for wid in ids:
+                    run("kdotool", "windowmove", wid, str(x), str(y), timeout=10)
+                return True
+            self.msleep(500)
+        return False
+
+    def run(self):
+        pos = None
+        if self.use_phantom:
+            info = outputs().get(PHANTOM_OUTPUT)
+            pos = info["pos"] if info else None
+            if pos is None:
+                self.done.emit(False, "phantom display is not up")
+                return
+
+        if steam_running():
+            self.progress.emit("Asking Steam to shut down…")
+            run("/usr/bin/steam", "-shutdown", timeout=30)
+            for _ in range(45):
+                if not steam_running():
+                    break
+                self.msleep(1000)
+            if steam_running():
+                self.progress.emit("Steam ignored shutdown, terminating…")
+                run("pkill", "-TERM", "-x", "steam")
+                for _ in range(20):
+                    if not steam_running():
+                        break
+                    self.msleep(1000)
+                run("pkill", "-KILL", "-x", "steam")
+                run("pkill", "-KILL", "-x", "steamwebhelper")
+                self.msleep(2000)
+
+        where = "phantom display" if self.use_phantom else "this desktop"
+        self.progress.emit(f"Starting gamescope at {self.width}×{self.height} on {where}…")
+        cmd = ["setsid", "gamescope", "-W", str(self.width), "-H", str(self.height)]
+        if self.refresh:
+            cmd += ["-r", str(int(round(self.refresh)))]
+        # Borderless on the phantom so the window is exactly the internal size;
+        # fullscreen on the real panel, where letterboxing is unavoidable.
+        cmd += ["-b"] if self.use_phantom else ["-f"]
+        cmd += ["-e", "--"] + DESKTOP_STEAM + ["-bigpicture"]
+        try:
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError as exc:
+            self.done.emit(False, str(exc))
+            return
+
+        if self.use_phantom:
+            self.progress.emit("Placing gamescope on the phantom display…")
+            if not self.place_on_phantom(pos):
+                self.done.emit(False, "gamescope started but its window was "
+                                      "not found to move onto the phantom")
+                return
+        else:
+            self.msleep(4000)
+        self.done.emit(True, f"gamescope running at {self.width}×{self.height} on {where}")
+
+
+def section(*rows):
+    """A group that keeps its own rows tight; only the gaps between sections grow."""
+    box = QWidget()
+    v = QVBoxLayout(box)
+    v.setContentsMargins(0, 0, 0, 0)
+    v.setSpacing(6)
+    for r in rows:
+        v.addLayout(r) if isinstance(r, QHBoxLayout) else v.addWidget(r)
+    box.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+    return box
+
+
+def heading(text):
+    lbl = QLabel(text)
+    lbl.setStyleSheet("font-weight: 600; margin-top: 4px;")
+    return lbl
+
+
+class Window(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Phantomscope")
+        self.worker = None
+        self.phantom_worker = None
+        self.stop_worker = None
+        self.busy = False
+
+        root = QVBoxLayout(self)
+        root.setSpacing(14)
+
+        intro = QLabel(
+            "Runs Steam inside a nested gamescope so Remote Play streams at "
+            "that aspect ratio."
+            + ("" if MODE == "lite" else
+               "\nFixed resolutions need the phantom display running."))
+        intro.setWordWrap(True)
+        root.addWidget(section(intro))
+
+        # --- phantom display (absent in lite installs) ------------------------
+        self.phantom_btn = None
+        self.preset_buttons = []
+        if MODE != "lite" and PHANTOM_OUTPUT:
+            self.phantom_btn, phantom_row = self._row(
+                "Start phantom", "checking…", lambda _: self.toggle_phantom())
+            preset_rows = []
+            for label, w, h, note in PRESETS:
+                btn, row = self._row(
+                    label, note,
+                    lambda _, a=w, b=h: self.switch(a, b, use_phantom=True))
+                self.preset_buttons.append(btn)
+                preset_rows.append(row)
+            root.addWidget(section(heading("Phantom display"), phantom_row,
+                                   *preset_rows))
+
+        # --- this desktop ----------------------------------------------------
+        self.native_btn, native_row = self._row("native", "detecting…",
+                                                lambda _: self.switch_native())
+        self.native = None
+        root.addWidget(section(heading("This desktop"), native_row))
+
+        # Slack lives here: everything above hugs the top, the stop section
+        # stays pinned to the bottom.
+        root.addStretch(1)
+
+        self.stop_btn = QPushButton("Stop gamescope and close Steam")
+        self.stop_btn.clicked.connect(self.stop)
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        root.addWidget(section(self.stop_btn, self.status))
+
+        self.refresh_native()
+        self.refresh()
+        t = QTimer(self)
+        t.timeout.connect(self.refresh)
+        t.start(3000)
+        tn = QTimer(self)
+        tn.timeout.connect(self.refresh_native)
+        tn.start(15000)
+
+    def _row(self, label, note, slot):
+        row = QHBoxLayout()
+        btn = QPushButton(label)
+        btn.setMinimumWidth(130)
+        btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        btn.clicked.connect(slot)
+        row.addWidget(btn)
+        hint = QLabel(note)
+        hint.setEnabled(False)
+        row.addWidget(hint, 1)
+        btn.hint = hint
+        return btn, row
+
+    # --- state ---------------------------------------------------------------
+    def refresh_native(self):
+        mode = native_mode()
+        if not mode:
+            self.native_btn.hint.setText("native  ·  not detected")
+            self.native_btn.setEnabled(False)
+            return
+        w, h, hz = mode
+        self.native = mode
+        self.native_btn.setText(f"{w} × {h}")
+        self.native_btn.hint.setText(f"native  ·  {aspect(w, h)}  ·  {hz:g} Hz")
+        self.native_btn.setEnabled(not self.busy)
+
+    def refresh(self):
+        if self.busy:
+            return
+        running = gamescope_running()
+        # It stops the phantom too, so stay live while any of the three is up.
+        self.stop_btn.setEnabled(running or steam_running() or phantom_up())
+        self.refresh_phantom()
+        if not self.status.text() or "gamescope" in self.status.text():
+            self.status.setText(
+                "gamescope session is running" if running
+                else ("Steam is running" if steam_running()
+                      else "Steam is not running"))
+
+    def refresh_phantom(self):
+        if self.phantom_btn is None:          # lite install, nothing to show
+            return
+        if self.phantom_worker and self.phantom_worker.isRunning():
+            return
+        up = phantom_up()
+        self.phantom_btn.setText("Stop phantom" if up else "Start phantom")
+        if up:
+            info = outputs().get(PHANTOM_OUTPUT)
+            size = "×".join(map(str, info["size"])) if info and info["size"] else "?"
+            self.phantom_btn.hint.setText(f"phantom display  ·  up  ·  {size}")
+        else:
+            self.phantom_btn.hint.setText("phantom display  ·  down")
+        # The presets only make sense with somewhere to put the window.
+        for b in self.preset_buttons:
+            b.setEnabled(up and not self.busy)
+
+    def set_busy(self, busy):
+        self.busy = busy
+        self.native_btn.setEnabled(not busy)
+        if self.phantom_btn is not None:
+            self.phantom_btn.setEnabled(not busy)
+        for b in self.preset_buttons:
+            b.setEnabled(not busy and phantom_up())
+
+    # --- actions -------------------------------------------------------------
+    def toggle_phantom(self):
+        if self.phantom_btn is None:
+            return
+        if self.phantom_worker and self.phantom_worker.isRunning():
+            return
+        action = "off" if phantom_up() else "on"
+        self.phantom_btn.setEnabled(False)
+        self.phantom_btn.hint.setText(f"phantom display  ·  turning {action}…")
+        self.phantom_worker = PhantomWorker(action)
+        self.phantom_worker.done.connect(self.phantom_done)
+        self.phantom_worker.start()
+
+    def phantom_done(self, ok, message):
+        if self.phantom_btn is not None:
+            self.phantom_btn.setEnabled(True)
+        self.refresh_phantom()
+        if not ok:
+            self.status.setText(f"Phantom: {message}")
+
+    def switch_native(self):
+        self.refresh_native()
+        if self.native:
+            self.switch(*self.native[:2], refresh=self.native[2], use_phantom=False)
+
+    def switch(self, width, height, refresh=None, use_phantom=False):
+        where = ("the phantom display, leaving this desktop alone"
+                 if use_phantom else "this desktop")
+        if QMessageBox.question(
+                self, "Restart Steam?",
+                f"This shuts down Steam and restarts it inside gamescope at "
+                f"{width}×{height} on {where}.\n\nQuit any running game first.",
+                QMessageBox.StandardButton.Ok |
+                QMessageBox.StandardButton.Cancel
+        ) != QMessageBox.StandardButton.Ok:
+            return
+        self.set_busy(True)
+        self.worker = Switcher(width, height, refresh, use_phantom)
+        self.worker.progress.connect(self.status.setText)
+        self.worker.done.connect(self.finished)
+        self.worker.start()
+
+    def finished(self, ok, message):
+        self.set_busy(False)
+        self.refresh_native()
+        self.status.setText(message if ok else f"Failed: {message}")
+
+    def stop(self):
+        if self.stop_worker and self.stop_worker.isRunning():
+            return
+        self.set_busy(True)
+        self.stop_btn.setEnabled(False)
+        self.stop_worker = StopWorker()
+        self.stop_worker.progress.connect(self.status.setText)
+        self.stop_worker.done.connect(self.stopped)
+        self.stop_worker.start()
+
+    def stopped(self, message):
+        self.set_busy(False)
+        self.status.setText(message)
+        self.refresh()
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setApplicationName("Phantomscope")
+    app.setDesktopFileName("phantomscope")
+    app.setWindowIcon(QIcon.fromTheme("virtual-desktops"))
+
+    # Single instance: if one is already up, ask it to surface and leave.
+    probe = QLocalSocket()
+    probe.connectToServer(INSTANCE_KEY)
+    if probe.waitForConnected(300):
+        probe.write(b"raise")
+        probe.flush()
+        probe.waitForBytesWritten(300)
+        probe.disconnectFromServer()
+        return 0
+    # Nothing answered, so any socket still on disk is from a crash.
+    QLocalServer.removeServer(INSTANCE_KEY)
+    server = QLocalServer()
+    server.listen(INSTANCE_KEY)
+
+    w = Window()
+    w.resize(430, 420)
+    w.show()
+
+    def surface():
+        conn = server.nextPendingConnection()
+        if conn is not None:
+            conn.disconnectFromServer()
+        w.setWindowState((w.windowState() & ~Qt.WindowState.WindowMinimized)
+                         | Qt.WindowState.WindowActive)
+        w.show()
+        w.raise_()
+        w.activateWindow()
+
+    server.newConnection.connect(surface)
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
